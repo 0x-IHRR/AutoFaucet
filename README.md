@@ -1,0 +1,1 @@
+auto claim testnet token
