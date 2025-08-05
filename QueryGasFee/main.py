@@ -11,6 +11,7 @@ Web3钱包链上Gas Fee查询统计工具
 import asyncio
 import json
 import time
+import glob
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 import aiohttp
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 import logging
 from pathlib import Path
+from aiohttp_socks import ProxyConnector
 
 # 配置日志
 logging.basicConfig(
@@ -115,10 +117,17 @@ class GasFeeTracker:
     
     async def __aenter__(self):
         """异步上下文管理器入口"""
+        # 配置SOCKS5代理
+        proxy_url = "socks5://rqtfip123456:rqtfip123456@92.112.155.40:7164"
+        
+        # 创建支持SOCKS5代理的连接器
+        connector = ProxyConnector.from_url(proxy_url)
+        
         self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30),
-            connector=aiohttp.TCPConnector(limit=100)
+            timeout=aiohttp.ClientTimeout(total=60),  # 增加超时时间
+            connector=connector
         )
+        
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -137,6 +146,10 @@ class GasFeeTracker:
     
     async def _make_api_request(self, url: str, params: Dict) -> Optional[Dict]:
         """发起API请求"""
+        if not self.session:
+            logger.error("Session未初始化")
+            return None
+            
         try:
             async with self.session.get(url, params=params) as response:
                 if response.status == 200:
@@ -161,30 +174,51 @@ class GasFeeTracker:
                                         api_key: str,
                                         start_block: int = 0,
                                         end_block: int = 99999999,
-                                        page: int = 1,
-                                        offset: int = 1000) -> List[Dict]:
-        """获取地址的交易记录"""
+                                        offset: int = 10000) -> List[Dict]:
+        """获取地址的交易记录（获取所有分页）"""
         if chain_name not in self.chains:
             logger.error(f"不支持的链: {chain_name}")
             return []
         
         chain = self.chains[chain_name]
-        await self._rate_limit_wait(chain_name)
+        all_transactions = []
+        page = 1
         
-        params = {
-            'module': 'account',
-            'action': 'txlist',
-            'address': address,
-            'startblock': start_block,
-            'endblock': end_block,
-            'page': page,
-            'offset': offset,
-            'sort': 'desc',
-            chain.api_key_param: api_key
-        }
+        while True:
+            await self._rate_limit_wait(chain_name)
+            
+            params = {
+                 'module': 'account',
+                 'action': 'txlist',
+                 'address': address,
+                 'startblock': start_block,
+                 'endblock': end_block,
+                 'page': page,
+                 'offset': offset,
+                 'sort': 'desc',
+                 chain.api_key_param: api_key
+             }
+            
+            result = await self._make_api_request(chain.api_base_url, params)
+            if not result or len(result) == 0:
+                break
+                
+            all_transactions.extend(result)
+            logger.info(f"获取第 {page} 页，共 {len(result)} 条交易")
+            
+            # 如果返回的交易数量少于offset，说明已经是最后一页
+            if len(result) < offset:
+                break
+                
+            page += 1
+            
+            # 安全限制：最多获取10页，避免无限循环
+            if page > 10:
+                logger.warning(f"已获取10页交易数据，停止获取更多页面")
+                break
         
-        result = await self._make_api_request(chain.api_base_url, params)
-        return result if result else []
+        logger.info(f"总共获取 {len(all_transactions)} 条交易")
+        return all_transactions
     
     async def get_internal_transactions(self, 
                                       address: str, 
@@ -210,13 +244,17 @@ class GasFeeTracker:
         }
         
         result = await self._make_api_request(chain.api_base_url, params)
-        return result if result else []
+        return result if result and isinstance(result, list) else []
     
     async def get_token_price(self, token_symbol: str) -> Optional[float]:
         """获取代币价格(USD)"""
+        if not self.session:
+            logger.error("Session未初始化")
+            return None
+            
+        url = f"https://api.coingecko.com/api/v3/simple/price"
         try:
             # 使用CoinGecko免费API获取价格
-            url = f"https://api.coingecko.com/api/v3/simple/price"
             token_map = {
                 'ETH': 'ethereum',
                 'BNB': 'binancecoin', 
@@ -292,6 +330,31 @@ class GasFeeTracker:
         
         return filtered
     
+    async def _get_block_by_timestamp(self, chain_name: str, timestamp: int, api_key: str) -> Optional[int]:
+        """根据时间戳获取区块号"""
+        if chain_name not in self.chains:
+            return None
+            
+        chain = self.chains[chain_name]
+        await self._rate_limit_wait(chain_name)
+        
+        params = {
+             'module': 'block',
+             'action': 'getblocknobytime',
+             'timestamp': timestamp,
+             'closest': 'before',
+             chain.api_key_param: api_key
+         }
+        
+        try:
+            result = await self._make_api_request(chain.api_base_url, params)
+            if result and 'result' in result:
+                return int(result['result'])
+        except Exception as e:
+            logger.warning(f"获取区块号失败: {e}")
+        
+        return None
+    
     async def analyze_gas_fees(self, 
                              addresses: List[str],
                              chains: List[str],
@@ -317,12 +380,32 @@ class GasFeeTracker:
             token_price = await self.get_token_price(chain.native_token)
             logger.info(f"{chain.native_token} 当前价格: ${token_price}")
             
+            # 计算区块范围
+            start_block = 0
+            end_block = 99999999
+            
+            if start_date:
+                start_timestamp = int(start_date.timestamp())
+                start_block = await self._get_block_by_timestamp(chain_name, start_timestamp, api_keys[chain_name])
+                if start_block:
+                    logger.info(f"开始时间 {start_date} 对应区块: {start_block}")
+                else:
+                    start_block = 0
+                    
+            if end_date:
+                end_timestamp = int(end_date.timestamp())
+                end_block = await self._get_block_by_timestamp(chain_name, end_timestamp, api_keys[chain_name])
+                if end_block:
+                    logger.info(f"结束时间 {end_date} 对应区块: {end_block}")
+                else:
+                    end_block = 99999999
+            
             for address in addresses:
-                logger.info(f"获取地址 {address} 在 {chain_name} 上的交易")
+                logger.info(f"获取地址 {address} 在 {chain_name} 上的交易 (区块范围: {start_block} - {end_block})")
                 
                 # 获取普通交易
                 normal_txs = await self.get_transactions_by_address(
-                    address, chain_name, api_keys[chain_name]
+                    address, chain_name, api_keys[chain_name], start_block, end_block
                 )
                 
                 # 获取内部交易
@@ -331,8 +414,16 @@ class GasFeeTracker:
                 )
                 
                 # 解析交易数据
-                for tx in normal_txs + internal_txs:
-                    if tx.get('from', '').lower() == address.lower():  # 只统计发出的交易
+                for tx in normal_txs:
+                    # 统计所有相关交易（发出和接收）
+                    if (tx.get('from', '').lower() == address.lower() or 
+                        tx.get('to', '').lower() == address.lower()):
+                        parsed_tx = self._parse_transaction(tx, chain_name, token_price)
+                        all_transactions.append(parsed_tx)
+                        
+                for tx in internal_txs:
+                    # 内部交易只统计发出的（因为内部交易通常是合约调用产生的gas费）
+                    if tx.get('from', '').lower() == address.lower():
                         parsed_tx = self._parse_transaction(tx, chain_name, token_price)
                         all_transactions.append(parsed_tx)
                 
@@ -343,7 +434,24 @@ class GasFeeTracker:
         filtered_transactions = self._filter_by_time_range(all_transactions, start_date, end_date)
         
         # 生成统计报告
-        return self._generate_statistics(filtered_transactions)
+        statistics = self._generate_statistics(filtered_transactions)
+        
+        # 返回包含交易数据和统计信息的完整结果
+        return {
+            'transactions': [{
+                'hash': tx.hash,
+                'chain': tx.chain_name,
+                'timestamp': tx.timestamp,
+                'from_address': tx.from_address,
+                'to_address': tx.to_address,
+                'gas_used': tx.gas_used,
+                'gas_price': tx.gas_price,
+                'gas_fee_eth': tx.gas_fee_eth,
+                'gas_fee_usd': tx.gas_fee_usd,
+                'transaction_type': tx.transaction_type
+            } for tx in filtered_transactions],
+            'statistics': statistics
+        }
     
     def _generate_statistics(self, transactions: List[TransactionData]) -> Dict:
         """生成统计报告"""
@@ -373,9 +481,9 @@ class GasFeeTracker:
             'summary': {
                 'total_transactions': len(transactions),
                 'total_gas_fee_eth': df['gas_fee_eth'].sum(),
-                'total_gas_fee_usd': df['gas_fee_usd'].sum() if df['gas_fee_usd'].notna().any() else None,
+                'total_gas_fee_usd': df['gas_fee_usd'].sum() if bool(df['gas_fee_usd'].notna().any()) else None,
                 'avg_gas_fee_eth': df['gas_fee_eth'].mean(),
-                'avg_gas_fee_usd': df['gas_fee_usd'].mean() if df['gas_fee_usd'].notna().any() else None,
+                'avg_gas_fee_usd': df['gas_fee_usd'].mean() if bool(df['gas_fee_usd'].notna().any()) else None,
                 'date_range': {
                     'start': df['date'].min(),
                     'end': df['date'].max()
@@ -409,7 +517,7 @@ class GasFeeTracker:
             stats['by_chain'][chain] = {
                 'transaction_count': len(chain_df),
                 'total_gas_fee_eth': chain_df['gas_fee_eth'].sum(),
-                'total_gas_fee_usd': chain_df['gas_fee_usd'].sum() if chain_df['gas_fee_usd'].notna().any() else None,
+                'total_gas_fee_usd': chain_df['gas_fee_usd'].sum() if bool(chain_df['gas_fee_usd'].notna().any()) else None,
                 'avg_gas_fee_eth': chain_df['gas_fee_eth'].mean(),
                 'avg_gas_price_gwei': chain_df['gas_price_gwei'].mean()
             }
@@ -420,7 +528,7 @@ class GasFeeTracker:
             stats['by_transaction_type'][tx_type] = {
                 'transaction_count': len(type_df),
                 'total_gas_fee_eth': type_df['gas_fee_eth'].sum(),
-                'total_gas_fee_usd': type_df['gas_fee_usd'].sum() if type_df['gas_fee_usd'].notna().any() else None,
+                'total_gas_fee_usd': type_df['gas_fee_usd'].sum() if bool(type_df['gas_fee_usd'].notna().any()) else None,
                 'avg_gas_fee_eth': type_df['gas_fee_eth'].mean()
             }
         
@@ -449,20 +557,42 @@ class GasFeeTracker:
             stats['by_address'][address] = {
                 'transaction_count': len(addr_df),
                 'total_gas_fee_eth': addr_df['gas_fee_eth'].sum(),
-                'total_gas_fee_usd': addr_df['gas_fee_usd'].sum() if addr_df['gas_fee_usd'].notna().any() else None,
+                'total_gas_fee_usd': addr_df['gas_fee_usd'].sum() if bool(addr_df['gas_fee_usd'].notna().any()) else None,
                 'avg_gas_fee_eth': addr_df['gas_fee_eth'].mean(),
                 'chains_used': addr_df['chain'].unique().tolist()
             }
         
         return stats
     
-    def save_results(self, stats: Dict, filename: str = None):
-        """保存结果到文件"""
-        if filename is None:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f'gas_fee_analysis_{timestamp}.json'
+    def save_results(self, stats: Dict, filename: str = None, auto_cleanup: bool = True):
+        """保存结果到文件
         
-        filepath = Path(filename)
+        Args:
+            stats: 统计数据
+            filename: 文件名，如果为None则自动生成
+            auto_cleanup: 是否自动清理旧文件
+        """
+        # 确保Data_Save目录存在
+        data_save_dir = Path("Data_Save")
+        data_save_dir.mkdir(exist_ok=True)
+        
+        if filename is None:
+            # 生成更有意义的文件名
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # 从统计数据中提取地址信息用于文件命名
+            address_info = ""
+            if 'summary' in stats and 'addresses' in stats['summary']:
+                addresses = stats['summary']['addresses']
+                if addresses:
+                    # 取第一个地址的后8位作为标识
+                    first_addr = addresses[0]
+                    address_info = f"_{first_addr[-8:]}"
+            
+            filename = f'gas_fee_analysis_{timestamp}{address_info}.json'
+        
+        # 将文件保存到Data_Save目录
+        filepath = data_save_dir / filename
         
         # 处理不能JSON序列化的数据
         def json_serializer(obj):
@@ -474,11 +604,51 @@ class GasFeeTracker:
                 return obj.item()
             raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
         
+        # 保存文件
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(stats, f, ensure_ascii=False, indent=2, default=json_serializer)
         
         logger.info(f"结果已保存到: {filepath}")
+        
+        # 自动清理旧文件
+        if auto_cleanup:
+            self._cleanup_old_files()
+        
         return filepath
+    
+    def _cleanup_old_files(self, max_files: int = 10):
+        """清理旧的分析结果文件
+        
+        Args:
+            max_files: 保留的最大文件数量
+        """
+        try:
+            # 确保Data_Save目录存在
+            data_save_dir = Path("Data_Save")
+            data_save_dir.mkdir(exist_ok=True)
+            
+            # 查找Data_Save目录中的所有gas fee分析文件
+            pattern = data_save_dir / "gas_fee_analysis_*.json"
+            files = glob.glob(str(pattern))
+            
+            if len(files) <= max_files:
+                return
+            
+            # 按修改时间排序，删除最旧的文件
+            files_with_time = [(f, Path(f).stat().st_mtime) for f in files]
+            files_with_time.sort(key=lambda x: x[1], reverse=True)
+            
+            files_to_delete = files_with_time[max_files:]
+            
+            for file_path, _ in files_to_delete:
+                try:
+                    Path(file_path).unlink()
+                    logger.info(f"已删除旧文件: {file_path}")
+                except Exception as e:
+                    logger.warning(f"删除文件失败 {file_path}: {e}")
+                    
+        except Exception as e:
+            logger.warning(f"清理旧文件时出错: {e}")
     
     def print_summary(self, stats: Dict):
         """打印统计摘要"""

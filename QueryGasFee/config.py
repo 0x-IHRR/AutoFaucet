@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-配置文件
-用于管理API密钥、链配置和其他设置
+配置管理模块
+
+负责管理API密钥、链配置等
 """
 
 import os
 from typing import Dict, List
 from dataclasses import dataclass
+from dotenv import load_dotenv
+
+# 加载.env文件
+load_dotenv()
 
 @dataclass
 class APIConfig:
